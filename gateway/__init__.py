@@ -1,0 +1,1 @@
+"""FastAPI query gateway package."""
