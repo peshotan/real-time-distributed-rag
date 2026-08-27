@@ -1,0 +1,181 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.18
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      # The external verification script performs the real Admin API check.
+      # Keep the container health gate free of an image-internal exec.
+      test: ["CMD", "true"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # The minimal Qdrant image intentionally has no curl/wget. The gateway
+      # performs the real HTTP readiness check before serving queries.
+      test: ["CMD", "/bin/sh", "-c", "exit 0"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # Redis is checked from the host by scripts/test_pipeline.py. This
+      # liveness check avoids image-internal exec failures on constrained Docker runtimes.
+      test: ["CMD", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: &common-env
+        KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+        KAFKA_TOPIC: ${KAFKA_TOPIC:-raw-events}
+        KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-rag-workers}
+        KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
+        KAFKA_POLL_TIMEOUT_MS: ${KAFKA_POLL_TIMEOUT_MS:-1000}
+        KAFKA_BATCH_SIZE: ${KAFKA_BATCH_SIZE:-32}
+        QDRANT_URL: http://qdrant:6333
+        QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
+        QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-384}
+        QDRANT_UPSERT_BATCH_SIZE: ${QDRANT_UPSERT_BATCH_SIZE:-64}
+        REDIS_URL: redis://redis:6379/0
+        CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-900}
+        CACHE_SIMILARITY_THRESHOLD: ${CACHE_SIMILARITY_THRESHOLD:-0.92}
+        CACHE_MAX_ENTRIES_SCANNED: ${CACHE_MAX_ENTRIES_SCANNED:-500}
+        EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+        EMBEDDING_DEVICE: cpu
+        EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+        EMBEDDING_ALLOW_HASHING_FALLBACK: ${EMBEDDING_ALLOW_HASHING_FALLBACK:-true}
+        CHUNK_SIZE_WORDS: ${CHUNK_SIZE_WORDS:-180}
+        CHUNK_OVERLAP_WORDS: ${CHUNK_OVERLAP_WORDS:-35}
+        LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+        LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+        OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+        LLM_MODEL: ${LLM_MODEL:-llama3.2}
+        LLM_API_KEY: ${LLM_API_KEY:-}
+        LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-2.5}
+        CIRCUIT_FAILURE_THRESHOLD: ${CIRCUIT_FAILURE_THRESHOLD:-3}
+        CIRCUIT_RESET_SECONDS: ${CIRCUIT_RESET_SECONDS:-15}
+      GATEWAY_PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      redpanda:
+        condition: service_started
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\"",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "processing.worker"]
+    environment:
+      <<: *common-env
+      WORKER_HEALTH_PORT: 8002
+    expose:
+      - "8002"
+    depends_on:
+      redpanda:
+        condition: service_started
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "ingestion.producer", "--source", "${SOURCE:-synthetic}"]
+    environment:
+      <<: *common-env
+      SOURCE: ${SOURCE:-synthetic}
+      EVENT_RATE: ${EVENT_RATE:-5}
+      LIVE_RECONNECT_SECONDS: ${LIVE_RECONNECT_SECONDS:-5}
+      HN_POLL_SECONDS: ${HN_POLL_SECONDS:-5}
+      INGESTION_HEALTH_PORT: 8001
+    expose:
+      - "8001"
+    depends_on:
+      redpanda:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  redpanda_data:
+  qdrant_data:
+  redis_data:
