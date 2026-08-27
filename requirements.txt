@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.5
+httpx==0.28.1
+redis[hiredis]==5.2.1
+qdrant-client==1.13.2
+kafka-python==2.0.2
+# Keep the stack CPU-only. The extra index provides the matching non-CUDA wheel.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+sentence-transformers==3.3.1
+numpy==2.2.1
+tenacity==9.0.0
+sse-starlette==2.2.1
