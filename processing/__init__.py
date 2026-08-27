@@ -1,0 +1,1 @@
+"""Streaming processing and vector indexing package."""
