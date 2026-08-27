@@ -1,4 +1,4 @@
-# Real-Time Distributed RAG Pipeline
+# Real-Time Streaming RAG Pipeline
 
 An end-to-end, local-first streaming RAG system. Events arrive through
 Redpanda, worker nodes chunk and embed them with
