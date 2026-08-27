@@ -1,0 +1,1 @@
+"""Adapters for public real-time sources."""
